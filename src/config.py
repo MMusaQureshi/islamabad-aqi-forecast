@@ -18,7 +18,7 @@ class Config:
     hopsworks_api_key: str | None = os.getenv("HOPSWORKS_API_KEY")
 
     feature_group_name: str = "aqi_islamabad_daily_features"
-    feature_group_version: int = 1
+    feature_group_version: int = 3
 
     feature_view_name: str = "aqi_islamabad_daily_fv"
     feature_view_version: int = 1
@@ -53,7 +53,6 @@ WEATHER_HOURLY_VARS = [
 ]
 
 TARGET_COLUMN = "aqi_mean"
-
 FEATURE_COLUMNS = [
     # pollutant forecast/observed daily aggregates
     "pm2_5_mean",
@@ -95,4 +94,10 @@ FEATURE_COLUMNS = [
     "day_of_week",
     "month",
     "is_weekend",
+    
+    "aqi_change_2d",
+    "aqi_accel",
+    "aqi_rolling_mean_14d",
+    "aqi_deviation_from_7d",
+    "season",
 ]
