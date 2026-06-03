@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environment
+.venv/
+venv/
+env/
+.venv-1/
+
+# Secrets
+.env
+.env.local
+
+# Local data files
+data/
+*.csv
+*.xlsx
+*.parquet
+
+# Local model artifacts
+model_artifacts/
+input_example.json
+
+# Streamlit secrets
+.streamlit/secrets.toml
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
