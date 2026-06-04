@@ -77,8 +77,8 @@ def run_hourly_feature_pipeline(past_days: int = 30) -> None:
         completed_daily_features["date"].max(),
     )
 
-    insert_daily_features(completed_daily_features)
-
+    insert_daily_features(completed_daily_features, wait=False)
+    
     logging.info(
         "Inserted/updated %s completed daily rows in Hopsworks Feature Store.",
         len(completed_daily_features),

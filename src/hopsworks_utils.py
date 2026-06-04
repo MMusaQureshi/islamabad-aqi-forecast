@@ -47,11 +47,9 @@ def get_or_create_daily_feature_group():
     return fg
 
 
-def insert_daily_features(df: pd.DataFrame) -> None:
+def insert_daily_features(df, wait: bool = True):
     fg = get_or_create_daily_feature_group()
-    # wait=True makes local/GitHub Actions logs clearer.
-    fg.insert(df, operation="upsert", wait=True)
-
+    fg.insert(df, operation="upsert", wait=wait)
 
 def read_daily_features() -> pd.DataFrame:
     fg = get_or_create_daily_feature_group()
