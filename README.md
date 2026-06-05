@@ -4,6 +4,8 @@ A serverless machine learning project for forecasting the **Air Quality Index (A
 
 The project includes automated data collection, feature engineering, cloud feature storage, model training, model registry, CI/CD automation, Streamlit dashboard deployment, AQI health alerts, and SHAP explainability.
 
+🔗 **Live Demo:** https://islamabad-aqi-forecast-krk8fy8vtnudqqeey2abhr.streamlit.app/
+
 ---
 
 ## Project Overview
