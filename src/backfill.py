@@ -17,7 +17,7 @@ def run_backfill(days: int = 90, write: bool = False):
     print(daily_features.tail())
 
     if write:
-        insert_daily_features(daily_features)
+        insert_daily_features(daily_features,wait=True)
         print("Inserted daily features into Hopsworks Feature Store.")
 
     return daily_features

@@ -34,7 +34,7 @@ def run_hourly_feature_pipeline(past_days: int = 30) -> None:
 
     hourly = fetch_realtime_plus_forecast_hourly(
         past_days=past_days,
-        forecast_days=0,
+        forecast_days=1,
     )
 
     logging.info("Fetched hourly rows: %s", len(hourly))

@@ -6,11 +6,16 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
+import numpy as np
 import pandas as pd
+import shap
 import streamlit as st
 
-from src.api_client import fetch_realtime_plus_forecast_hourly
-from src.predict import load_local_best_model, direct_three_day_forecast
+from src.predict import (
+    load_local_best_model,
+    direct_three_day_forecast,
+    _latest_completed_row,
+)
 
 
 # ---------------------------------------------------------
@@ -122,22 +127,62 @@ st.markdown(
 
 
 # ---------------------------------------------------------
-# HELPER FUNCTIONS
+# PATHS / CACHE HELPERS
 # ---------------------------------------------------------
 
-def get_aqi_category(aqi: float) -> str:
-    if aqi <= 50:
-        return "Good"
-    if aqi <= 100:
-        return "Moderate"
-    if aqi <= 150:
-        return "Unhealthy for Sensitive Groups"
-    if aqi <= 200:
-        return "Unhealthy"
-    if aqi <= 300:
-        return "Very Unhealthy"
-    return "Hazardous"
+MODEL_DIR = PROJECT_ROOT / "model_artifacts" / "best_model"
 
+
+def get_model_signature() -> str:
+    """
+    Used to refresh cached model if model artifacts change after retraining.
+    """
+    paths = [
+        MODEL_DIR / "metadata.json",
+        MODEL_DIR / "model.joblib",
+        MODEL_DIR / "keras_model.keras",
+        MODEL_DIR / "scaler.joblib",
+    ]
+
+    # Horizon-specific artifacts
+    for i in [1, 2, 3]:
+        paths.extend(
+            [
+                MODEL_DIR / f"horizon_{i}_model.joblib",
+                MODEL_DIR / f"horizon_{i}_keras_model.keras",
+                MODEL_DIR / f"horizon_{i}_scaler.joblib",
+            ]
+        )
+
+    parts = []
+
+    for path in paths:
+        if path.exists():
+            parts.append(f"{path.name}:{path.stat().st_mtime}")
+
+    return "|".join(parts)
+
+
+@st.cache_resource(show_spinner="Loading trained model...")
+def cached_model_bundle(model_signature: str) -> dict:
+    """
+    Cache model loading so Streamlit does not reload model artifacts every refresh.
+    """
+    return load_local_best_model(MODEL_DIR)
+
+
+@st.cache_data(ttl=900, show_spinner="Generating next 3 days AQI forecast...")
+def cached_direct_forecast(model_signature: str) -> pd.DataFrame:
+    """
+    Cache forecast for 15 minutes to avoid repeated live API calls.
+    """
+    bundle = load_local_best_model(MODEL_DIR)
+    return direct_three_day_forecast(bundle, days=3)
+
+
+# ---------------------------------------------------------
+# HELPER FUNCTIONS
+# ---------------------------------------------------------
 
 def get_short_category(category: str) -> str:
     mapping = {
@@ -215,84 +260,343 @@ def readable_table(df: pd.DataFrame) -> None:
     st.table(styled)
 
 
-def get_latest_observed_aqi() -> dict:
+def _average_shap_values(shap_values: object) -> np.ndarray | None:
     """
-    Gets latest available AQI and pollutant values from the API.
+    Converts SHAP output into one importance vector.
+
+    Supports:
+    - list of outputs
+    - ndarray: (samples, features)
+    - ndarray: (samples, features, outputs)
+    - ndarray: (outputs, samples, features)
     """
-    hourly = fetch_realtime_plus_forecast_hourly(past_days=2, forecast_days=3)
-    hourly["timestamp"] = pd.to_datetime(hourly["timestamp"])
+    if isinstance(shap_values, list):
+        return np.mean(
+            [np.abs(output_values[0]) for output_values in shap_values],
+            axis=0,
+        )
 
-    now = pd.Timestamp.now()
-    observed = hourly[hourly["timestamp"] <= now].copy()
+    shap_array = np.array(shap_values)
 
-    if observed.empty:
-        latest = hourly.iloc[-1]
-    else:
-        latest = observed.iloc[-1]
+    if shap_array.ndim == 3:
+        # Common multi-output shape: (samples, features, outputs)
+        if shap_array.shape[0] == 1:
+            return np.mean(np.abs(shap_array[0]), axis=1)
 
-    aqi = float(latest["us_aqi"])
+        # Alternative multi-output shape: (outputs, samples, features)
+        if shap_array.shape[1] == 1:
+            return np.mean(np.abs(shap_array[:, 0, :]), axis=0)
 
-    return {
-        "timestamp": latest["timestamp"],
-        "aqi": round(aqi, 1),
-        "category": get_aqi_category(aqi),
-        "pm2_5": round(float(latest["pm2_5"]), 1),
-        "pm10": round(float(latest["pm10"]), 1),
-        "ozone": round(float(latest["ozone"]), 1),
-        "nitrogen_dioxide": round(float(latest["nitrogen_dioxide"]), 1),
-        "carbon_monoxide": round(float(latest["carbon_monoxide"]), 1),
-    }
+        return np.mean(np.abs(shap_array), axis=(0, 2))
+
+    if shap_array.ndim == 2:
+        return np.abs(shap_array[0])
+
+    if shap_array.ndim == 1:
+        return np.abs(shap_array)
+
+    return None
 
 
-def get_feature_importance(bundle: dict) -> pd.DataFrame | None:
+def _get_single_model_importance(
+    selected_model: str,
+    model,
+    selected_features: list[str],
+) -> pd.DataFrame | None:
     """
-    Returns feature importance for Ridge Regression or Random Forest.
-
-    For Ridge Regression:
-    - Direct forecasting has 3 outputs.
-    - Ridge coefficients become a 2D matrix: horizons × features.
-    - We average absolute coefficient values across Day 1, Day 2, and Day 3.
-
-    For Random Forest:
-    - Built-in feature_importances_ is used.
+    Normal feature importance for one model.
+    Supports Ridge Regression and Random Forest.
     """
-    metadata = bundle["metadata"]
-    model_name = metadata["best_model"]
-    selected_features = metadata["selected_features"]
-    model = bundle["model"]
-
-    if model_name == "ridge_regression":
+    if selected_model == "ridge_regression":
         ridge_model = model.named_steps["model"]
-        values = abs(ridge_model.coef_)
+        values = np.abs(ridge_model.coef_)
 
         if values.ndim == 2:
             values = values.mean(axis=0)
 
-    elif model_name == "random_forest":
+    elif selected_model == "random_forest":
         values = model.feature_importances_
 
     else:
         return None
 
-    importance = pd.DataFrame(
+    return pd.DataFrame(
         {
             "Feature": selected_features,
             "Importance": values,
         }
-    ).sort_values("Importance", ascending=False)
+    )
 
+
+def get_feature_importance(bundle: dict) -> pd.DataFrame | None:
+    """
+    Returns normal feature importance.
+
+    Supports:
+    - Old single Ridge Regression model
+    - Old single Random Forest model
+    - New horizon-specific ensemble with Ridge/Random Forest horizon models
+    """
+    metadata = bundle["metadata"]
+
+    # -----------------------------------------------------
+    # New horizon-specific ensemble
+    # -----------------------------------------------------
+    if metadata.get("forecast_method") == "horizon_specific_direct_multi_horizon":
+        horizon_models = bundle.get("horizon_models", {})
+        frames = []
+
+        for horizon, payload in horizon_models.items():
+            selected_model = payload.get("selected_model")
+            framework = payload.get("framework")
+
+            if framework != "sklearn":
+                continue
+
+            model = payload.get("model")
+            selected_features = payload.get("selected_features", [])
+
+            frame = _get_single_model_importance(
+                selected_model=selected_model,
+                model=model,
+                selected_features=selected_features,
+            )
+
+            if frame is not None:
+                frame["Horizon"] = f"Day {horizon}"
+                frame["Model"] = selected_model
+                frames.append(frame)
+
+        if not frames:
+            return None
+
+        all_importance = pd.concat(frames, ignore_index=True)
+
+        final_importance = (
+            all_importance.groupby("Feature", as_index=False)["Importance"]
+            .mean()
+            .sort_values("Importance", ascending=False)
+        )
+
+        final_importance["Importance"] = final_importance["Importance"].round(4)
+
+        return final_importance
+
+    # -----------------------------------------------------
+    # Old single-model format
+    # -----------------------------------------------------
+    model_name = metadata["best_model"]
+    selected_features = metadata["selected_features"]
+    model = bundle["model"]
+
+    importance = _get_single_model_importance(
+        selected_model=model_name,
+        model=model,
+        selected_features=selected_features,
+    )
+
+    if importance is None:
+        return None
+
+    importance = importance.sort_values("Importance", ascending=False)
     importance["Importance"] = importance["Importance"].round(4)
 
     return importance
 
 
-def get_metric(test_metrics: dict, new_key: str, old_key: str, default: float = 0.0) -> float:
+@st.cache_data(ttl=900, show_spinner="Computing SHAP explanation...")
+def get_shap_explanation(model_signature: str) -> pd.DataFrame | None:
     """
-    Supports both old recursive metadata and new direct multi-horizon metadata.
-    New direct model uses avg_rmse, avg_mae, avg_r2.
-    Old model used rmse, mae, r2.
+    Computes SHAP explanation for the latest prediction row.
+
+    Supports:
+    - Old single Ridge Regression model
+    - Old single Random Forest model
+    - New horizon-specific ensemble:
+        Day 1 model
+        Day 2 model
+        Day 3 model
+
+    For horizon-specific models:
+    - SHAP is computed separately for each horizon.
+    - Final SHAP importance is averaged across supported horizons.
     """
-    return float(test_metrics.get(new_key, test_metrics.get(old_key, default)))
+
+    bundle = load_local_best_model(MODEL_DIR)
+    metadata = bundle["metadata"]
+
+    # -----------------------------------------------------
+    # Case 1: New horizon-specific ensemble
+    # -----------------------------------------------------
+    if metadata.get("forecast_method") == "horizon_specific_direct_multi_horizon":
+        horizon_models = bundle.get("horizon_models", {})
+
+        supported_horizons = []
+
+        for horizon, payload in horizon_models.items():
+            selected_model = payload.get("selected_model")
+            framework = payload.get("framework")
+
+            if framework == "sklearn" and selected_model in [
+                "ridge_regression",
+                "random_forest",
+            ]:
+                supported_horizons.append((horizon, payload))
+
+        if not supported_horizons:
+            return None
+
+        all_features = sorted(
+            {
+                feature
+                for _, payload in supported_horizons
+                for feature in payload["selected_features"]
+            }
+        )
+
+        latest_row, latest_date, source = _latest_completed_row(all_features)
+
+        horizon_shap_frames = []
+
+        for horizon, payload in supported_horizons:
+            selected_model = payload["selected_model"]
+            selected_features = payload["selected_features"]
+            model = payload["model"]
+
+            X = pd.DataFrame([latest_row[selected_features].to_dict()])
+
+            if selected_model == "ridge_regression":
+                scaler = model.named_steps["scaler"]
+                ridge_model = model.named_steps["model"]
+
+                X_scaled = scaler.transform(X)
+
+                # In standardized space, zero represents average training conditions.
+                background = np.zeros((1, X_scaled.shape[1]))
+
+                explainer = shap.LinearExplainer(ridge_model, background)
+                shap_values = explainer.shap_values(X_scaled)
+                explainer_name = "SHAP LinearExplainer"
+
+            elif selected_model == "random_forest":
+                explainer = shap.TreeExplainer(model)
+                shap_values = explainer.shap_values(X)
+                explainer_name = "SHAP TreeExplainer"
+
+            else:
+                continue
+
+            values = _average_shap_values(shap_values)
+
+            if values is None:
+                continue
+
+            horizon_df = pd.DataFrame(
+                {
+                    "Feature": selected_features,
+                    "SHAP Importance": values,
+                    "Horizon": f"Day {horizon}",
+                    "Model": selected_model,
+                    "Explainer": explainer_name,
+                    "Source Row": f"{latest_date:%Y-%m-%d} from {source}",
+                }
+            )
+
+            horizon_shap_frames.append(horizon_df)
+
+        if not horizon_shap_frames:
+            return None
+
+        all_shap = pd.concat(horizon_shap_frames, ignore_index=True)
+
+        final_shap = (
+            all_shap.groupby("Feature", as_index=False)["SHAP Importance"]
+            .mean()
+            .sort_values("SHAP Importance", ascending=False)
+        )
+
+        final_shap["SHAP Importance"] = final_shap["SHAP Importance"].round(4)
+        final_shap["Explainer"] = "Horizon-specific SHAP"
+        final_shap["Source Row"] = all_shap["Source Row"].iloc[0]
+
+        return final_shap
+
+    # -----------------------------------------------------
+    # Case 2: Old single-model format
+    # -----------------------------------------------------
+    model_name = metadata["best_model"]
+    selected_features = metadata["selected_features"]
+    model = bundle["model"]
+
+    latest_row, latest_date, source = _latest_completed_row(selected_features)
+    X = pd.DataFrame([latest_row[selected_features].to_dict()])
+
+    if model_name == "ridge_regression":
+        scaler = model.named_steps["scaler"]
+        ridge_model = model.named_steps["model"]
+
+        X_scaled = scaler.transform(X)
+        background = np.zeros((1, X_scaled.shape[1]))
+
+        explainer = shap.LinearExplainer(ridge_model, background)
+        shap_values = explainer.shap_values(X_scaled)
+        explainer_name = "SHAP LinearExplainer"
+
+    elif model_name == "random_forest":
+        explainer = shap.TreeExplainer(model)
+        shap_values = explainer.shap_values(X)
+        explainer_name = "SHAP TreeExplainer"
+
+    else:
+        return None
+
+    values = _average_shap_values(shap_values)
+
+    if values is None:
+        return None
+
+    shap_df = pd.DataFrame(
+        {
+            "Feature": selected_features,
+            "SHAP Importance": values,
+        }
+    ).sort_values("SHAP Importance", ascending=False)
+
+    shap_df["SHAP Importance"] = shap_df["SHAP Importance"].round(4)
+    shap_df["Source Row"] = f"{latest_date:%Y-%m-%d} from {source}"
+    shap_df["Explainer"] = explainer_name
+
+    return shap_df
+
+
+def get_forecast_uncertainty(metadata: dict) -> int:
+    """
+    Uses average test MAE internally for uncertainty range.
+    The dashboard does not show RMSE/MAE/R² metrics separately.
+    """
+    test_metrics = metadata.get("test_metrics", {})
+    avg_mae = test_metrics.get("avg_mae", test_metrics.get("mae", 13.0))
+
+    try:
+        return round(float(avg_mae))
+    except Exception:
+        return 13
+
+
+# ---------------------------------------------------------
+# SIDEBAR
+# ---------------------------------------------------------
+
+st.sidebar.title("Dashboard Controls")
+
+st.sidebar.info(
+    "Forecast and SHAP explanations are cached for 15 minutes. "
+    "Use refresh only when needed."
+)
+
+if st.sidebar.button("🔄 Refresh forecast"):
+    st.cache_data.clear()
+    st.rerun()
 
 
 # ---------------------------------------------------------
@@ -305,73 +609,47 @@ st.caption(
     "Daily AQI forecast generated from weather and pollutant features using direct multi-horizon forecasting."
 )
 
+model_signature = get_model_signature()
+
 try:
-    # Load local best model saved by src.train_pipeline
-    bundle = load_local_best_model()
+    bundle = cached_model_bundle(model_signature)
     metadata = bundle["metadata"]
 
-    # Generate direct 3-day forecast
-    forecast = direct_three_day_forecast(bundle, days=3)
+except Exception as exc:
+    st.error("Failed to load local trained model.")
+    st.exception(exc)
+    st.stop()
 
-    # Latest observed AQI
-    latest = get_latest_observed_aqi()
 
-    # Model metadata
-    test_metrics = metadata.get("test_metrics", {})
-    validation_comparison = pd.DataFrame(metadata.get("validation_comparison", []))
+# ---------------------------------------------------------
+# LOAD FORECAST SAFELY
+# ---------------------------------------------------------
 
-    avg_test_rmse = get_metric(test_metrics, "avg_rmse", "rmse")
-    avg_test_mae = get_metric(test_metrics, "avg_mae", "mae", default=13.0)
-    avg_test_r2 = get_metric(test_metrics, "avg_r2", "r2")
+forecast = None
 
-    uncertainty = round(avg_test_mae) if avg_test_mae else 13
+try:
+    forecast = cached_direct_forecast(model_signature)
 
-    forecast_method = metadata.get("forecast_method", "direct_multi_horizon")
-    training_rows = metadata.get("training_rows", "N/A")
+except Exception as exc:
+    st.error("Could not generate the 3-day forecast.")
+    st.warning(
+        "This usually happens when live API data is temporarily unavailable, returns 502, "
+        "or the network has SSL/time-out issues. Try Refresh forecast after 1–2 minutes."
+    )
+    with st.expander("Show forecast error details"):
+        st.exception(exc)
 
-    # -----------------------------------------------------
-    # CURRENT AQI
-    # -----------------------------------------------------
 
-    st.subheader("Current / Latest Observed AQI")
+uncertainty = get_forecast_uncertainty(metadata)
 
-    current_cols = st.columns(6)
 
-    with current_cols[0]:
-        st.metric(
-            label="Latest AQI",
-            value=latest["aqi"],
-            delta=get_short_category(latest["category"]),
-        )
+# ---------------------------------------------------------
+# FORECAST CARDS
+# ---------------------------------------------------------
 
-    with current_cols[1]:
-        st.metric("PM2.5", latest["pm2_5"])
+st.subheader("Next 3 Days AQI Forecast")
 
-    with current_cols[2]:
-        st.metric("PM10", latest["pm10"])
-
-    with current_cols[3]:
-        st.metric("Ozone", latest["ozone"])
-
-    with current_cols[4]:
-        st.metric("NO₂", latest["nitrogen_dioxide"])
-
-    with current_cols[5]:
-        st.metric("CO", latest["carbon_monoxide"])
-
-    st.caption(f"Latest API timestamp: {latest['timestamp']}")
-
-    current_message, current_level = get_alert_message(latest["aqi"])
-    show_alert(current_message, current_level)
-
-    st.divider()
-
-    # -----------------------------------------------------
-    # FORECAST CARDS
-    # -----------------------------------------------------
-
-    st.subheader("Next 3 Days AQI Forecast")
-
+if forecast is not None and not forecast.empty:
     cols = st.columns(3)
 
     for i, row in forecast.iterrows():
@@ -389,16 +667,22 @@ try:
             show_alert(message, level)
 
     st.caption(
-        f"±{uncertainty} AQI is based on the selected model's average test MAE. "
         "Forecast values are estimates and may change as new API data arrives."
     )
 
-    st.divider()
+else:
+    st.info(
+        "3-day forecast is temporarily unavailable because live feature data could not be fetched."
+    )
 
-    # -----------------------------------------------------
-    # FORECAST CHART
-    # -----------------------------------------------------
+st.divider()
 
+
+# ---------------------------------------------------------
+# FORECAST CHART AND RAW TABLE
+# ---------------------------------------------------------
+
+if forecast is not None and not forecast.empty:
     st.subheader("Forecast Trend")
 
     chart_df = forecast.copy()
@@ -406,10 +690,6 @@ try:
     chart_df = chart_df.set_index("date")
 
     st.line_chart(chart_df["predicted_daily_aqi"])
-
-    # -----------------------------------------------------
-    # RAW FORECAST TABLE
-    # -----------------------------------------------------
 
     st.subheader("Raw Forecast Table")
 
@@ -424,151 +704,108 @@ try:
 
     readable_table(forecast_display)
 
-    st.divider()
+st.divider()
 
-    # -----------------------------------------------------
-    # MODEL PERFORMANCE
-    # -----------------------------------------------------
 
-    st.subheader("Model Performance")
+# ---------------------------------------------------------
+# FEATURE SELECTION AND IMPORTANCE
+# ---------------------------------------------------------
 
-    metric_cols = st.columns(5)
+st.subheader("Feature Selection and Importance")
 
-    with metric_cols[0]:
-        st.metric("Best Model", metadata.get("best_model", "N/A"))
+selected_features = metadata.get("selected_features", [])
 
-    with metric_cols[1]:
-        st.metric("Avg Test RMSE", round(avg_test_rmse, 2))
+# For horizon-specific model, metadata["selected_features"] is the union across horizons.
+st.write("Selected features used by the selected model/system:")
 
-    with metric_cols[2]:
-        st.metric("Avg Test MAE", round(avg_test_mae, 2))
+selected_features_df = pd.DataFrame(
+    {
+        "No.": range(1, len(selected_features) + 1),
+        "Selected Feature": selected_features,
+    }
+)
 
-    with metric_cols[3]:
-        st.metric("Avg Test R²", round(avg_test_r2, 2))
+readable_table(selected_features_df)
 
-    with metric_cols[4]:
-        st.metric("Training Rows", training_rows)
+importance = get_feature_importance(bundle)
 
-    st.caption(f"Forecast method: {forecast_method}")
+if importance is not None:
+    st.subheader("Feature Importance Chart")
 
-    # Day-wise test metrics for direct forecasting
-    day_metric_rows = []
+    chart_importance = importance.set_index("Feature")["Importance"]
+    st.bar_chart(chart_importance)
 
-    for day in [1, 2, 3]:
-        day_metric_rows.append(
-            {
-                "Forecast Horizon": f"Day {day}",
-                "Test RMSE": round(test_metrics.get(f"day_{day}_rmse", 0), 3),
-                "Test MAE": round(test_metrics.get(f"day_{day}_mae", 0), 3),
-                "Test R²": round(test_metrics.get(f"day_{day}_r2", 0), 3),
-            }
-        )
+    st.subheader("Feature Importance Table")
+    readable_table(importance)
 
-    day_metrics_df = pd.DataFrame(day_metric_rows)
-
-    if day_metrics_df[["Test RMSE", "Test MAE", "Test R²"]].sum().sum() != 0:
-        st.subheader("Day-wise Test Metrics")
-        readable_table(day_metrics_df)
-
-    # Validation comparison
-    if not validation_comparison.empty:
-        st.subheader("Validation Comparison of 3 Models")
-
-        validation_display = validation_comparison.copy()
-
-        validation_display = validation_display.rename(
-            columns={
-                "model": "Model",
-                "avg_rmse": "Avg Validation RMSE",
-                "avg_mae": "Avg Validation MAE",
-                "avg_r2": "Avg Validation R²",
-                "day_1_mae": "Day 1 MAE",
-                "day_2_mae": "Day 2 MAE",
-                "day_3_mae": "Day 3 MAE",
-                "rmse": "Validation RMSE",
-                "mae": "Validation MAE",
-                "r2": "Validation R²",
-            }
-        )
-
-        numeric_cols = validation_display.select_dtypes(include="number").columns
-        validation_display[numeric_cols] = validation_display[numeric_cols].round(3)
-
-        readable_table(validation_display)
-
-    st.divider()
-
-    # -----------------------------------------------------
-    # FEATURE SELECTION AND IMPORTANCE
-    # -----------------------------------------------------
-
-    st.subheader("Feature Selection and Importance")
-
-    selected_features = metadata.get("selected_features", [])
-
-    st.write("Selected features used by the best model:")
-
-    selected_features_df = pd.DataFrame(
-        {
-            "No.": range(1, len(selected_features) + 1),
-            "Selected Feature": selected_features,
-        }
+else:
+    st.info(
+        "Normal feature importance is available for Ridge Regression and Random Forest models. "
+        "If TensorFlow or baseline models are selected for all horizons, use SHAP/LIME separately."
     )
 
-    readable_table(selected_features_df)
+st.divider()
 
-    importance = get_feature_importance(bundle)
 
-    if importance is not None:
-        st.subheader("Feature Importance Chart")
+# ---------------------------------------------------------
+# SHAP EXPLAINABILITY
+# ---------------------------------------------------------
 
-        chart_importance = importance.set_index("Feature")["Importance"]
-        st.bar_chart(chart_importance)
+st.subheader("SHAP Explainability")
 
-        st.subheader("Feature Importance Table")
-        readable_table(importance)
+try:
+    shap_df = get_shap_explanation(model_signature)
+
+    if shap_df is not None and not shap_df.empty:
+        explainer_used = shap_df["Explainer"].iloc[0]
+
+        st.write(
+            f"{explainer_used} was used to explain the selected model/system. "
+            "For the horizon-specific 3-day forecast, SHAP values are averaged across supported Day 1, Day 2, and Day 3 models."
+        )
+
+        shap_chart = shap_df.set_index("Feature")["SHAP Importance"]
+        st.bar_chart(shap_chart)
+
+        st.subheader("SHAP Explanation Table")
+        readable_table(shap_df)
 
     else:
         st.info(
-            "Feature importance is not directly available for the TensorFlow model. "
-            "Use SHAP separately for deep learning explanations."
+            "SHAP explanation is available for Ridge Regression and Random Forest horizon models. "
+            "If TensorFlow or baseline models are selected for all horizons, use a separate SHAP/LIME notebook explanation."
         )
 
-    st.divider()
-
-    # -----------------------------------------------------
-    # PROJECT PIPELINE SUMMARY
-    # -----------------------------------------------------
-
-    st.subheader("Project Pipeline Summary")
-
-    st.markdown(
-        """
-        **Pipeline used in this project:**
-
-        1. Fetch weather and pollutant data for Islamabad.
-        2. Convert hourly data into daily AQI forecasting features.
-        3. Store processed features in **Hopsworks Feature Store**.
-        4. Train **Ridge Regression**, **Random Forest**, and **TensorFlow MLP**.
-        5. Select the best model using **average RMSE**, **average MAE**, and **average R²** across the 3 forecast days.
-        6. Register the best model in **Hopsworks Model Registry**.
-        7. Generate next 3 days AQI forecast using **direct multi-horizon forecasting**.
-        8. Display AQI forecast, categories, alerts, model metrics, and feature importance.
-        """
-    )
-
-    st.info(
-        "Direct multi-horizon forecasting predicts Day 1, Day 2, and Day 3 AQI directly. "
-        "This avoids error accumulation that can occur in recursive forecasting."
-    )
-
-    # -----------------------------------------------------
-    # RAW METADATA
-    # -----------------------------------------------------
-
-    with st.expander("Show Raw Model Metadata"):
-        st.json(metadata)
-
 except Exception as exc:
-    st.error("Dashboard failed to load.")
-    st.exception(exc)
+    st.warning("SHAP explanation could not be generated.")
+    with st.expander("Show SHAP error details"):
+        st.exception(exc)
+
+st.divider()
+
+
+# ---------------------------------------------------------
+# PROJECT PIPELINE SUMMARY
+# ---------------------------------------------------------
+
+st.subheader("Project Pipeline Summary")
+
+st.markdown(
+    """
+    **Pipeline used in this project:**
+
+    1. Fetch weather and pollutant data for Islamabad.
+    2. Convert hourly data into daily AQI forecasting features.
+    3. Store processed features in **Hopsworks Feature Store**.
+    4. Train **Ridge Regression**, **Random Forest**, and **TensorFlow MLP**.
+    5. Select the best model for direct daily AQI forecasting.
+    6. Register the selected model in **Hopsworks Model Registry**.
+    7. Generate the next 3 days AQI forecast using **direct multi-horizon forecasting**.
+    8. Display AQI forecast, AQI categories, health alerts, selected features, feature importance, and **SHAP explainability**.
+    """
+)
+
+st.info(
+    "Direct multi-horizon forecasting predicts Day 1, Day 2, and Day 3 AQI directly. "
+    "This avoids error accumulation that can occur in recursive forecasting."
+)

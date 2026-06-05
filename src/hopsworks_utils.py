@@ -51,9 +51,37 @@ def insert_daily_features(df, wait: bool = True):
     fg = get_or_create_daily_feature_group()
     fg.insert(df, operation="upsert", wait=wait)
 
+
 def read_daily_features() -> pd.DataFrame:
     fg = get_or_create_daily_feature_group()
     return fg.read()
+
+
+def read_recent_daily_features() -> pd.DataFrame:
+    """Read daily features from the cloud, sorted oldest -> newest by date.
+
+    Used by the prediction path so the dashboard can serve forecasts straight
+    from the Feature Store (the cloud) even while the live weather API is down.
+    """
+    df = read_daily_features()
+    if df is None or len(df) == 0:
+        return pd.DataFrame()
+    df = df.copy()
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.sort_values(["city", "date"]) if "city" in df.columns else df.sort_values("date")
+    return df.reset_index(drop=True)
+
+
+def try_read_recent_daily_features() -> pd.DataFrame | None:
+    """Best-effort cloud read. Returns None on any failure (no creds, network,
+    empty store) so callers can fall back to the live API gracefully."""
+    try:
+        df = read_recent_daily_features()
+        return df if len(df) else None
+    except Exception as exc:
+        print(f"Could not read features from the cloud ({exc}). Falling back to live API.")
+        return None
 
 
 def register_sklearn_model(model_dir: str | Path, metrics: dict, input_example) -> None:
